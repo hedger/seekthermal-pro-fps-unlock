@@ -80,6 +80,13 @@ OP_SET_FEATURED_FIRMWARE_DATA = 0x50  # OUT — write upgrade chunk
 OP_COMPLETE_MEMORY_UPGRADE    = 0x51  # OUT — verify+commit (u16 checksum)
 OP_BEGIN_FIRMWARE_UPGRADE     = 0x52  # OUT — select bank (u16 subcmd)
 OP_RESET_DEVICE               = 0x59
+OP_SET_RAM_DATA_FEATURES      = 0x5A  # OUT — arm upgrade-window (case 0 = device-id block)
+
+# SetRamDataFeatures case IDs
+RAM_DATA_CASE_DEVICE_ID = 0  # window → g_device_id_block_a (248 B); serial at +16
+# arg1 is the window size in u16 words (window_bytes = arg1 * 2).
+# Case 0 validates arg1 <= 0x7C (124), so 124 * 2 = 248 bytes max.
+RAM_DATA_CASE0_ARG1 = 124   # 0x7C — requests the full 248-byte device-id block
 
 SUBCMD_MAIN_FW   = 0       # write target / factory-bank read alias
 SUBCMD_ACTIVE_FW = 8       # second bank (Bank B) — reflects last write (see FINDINGS.md)
@@ -226,6 +233,27 @@ class Wire:
 
     def complete_upgrade(self, csum16: int) -> None:
         self.out(OP_COMPLETE_MEMORY_UPGRADE, csum16.to_bytes(2, "little"))
+
+    def set_ram_data_features(self, case: int, arg1: int = 0, arg2: int = 0) -> None:
+        self.out(OP_SET_RAM_DATA_FEATURES,
+                 struct.pack("<HHH", case, arg1, arg2))
+
+    def get_serial(self) -> str:
+        """Read the 12-char ASCII serial from g_device_id_block_a offset +16.
+
+        Uses the SetRamDataFeatures(case=0, arg1=124) → GetFeaturedFirmwareData path
+        (non-destructive RAM read; auto-disarms after the window is consumed).
+        arg1=124 (0x7C) → window_size = 124*2 = 248 bytes (firmware validated max).
+        Returns an empty string on any failure.
+        """
+        try:
+            self.set_ram_data_features(RAM_DATA_CASE_DEVICE_ID, arg1=RAM_DATA_CASE0_ARG1)
+            block = self.read_chunk(248)
+            # serial is 12 ASCII bytes at offset 16 (0x10)
+            raw = block[16:28]
+            return raw.rstrip(b"\x00").decode("ascii", errors="replace")
+        except Exception:
+            return ""
 
     def reset(self) -> None:
         try:
@@ -607,10 +635,8 @@ def run(args: argparse.Namespace) -> int:
     dev = open_device()
     w = Wire(dev)
     print(f"      op_mode={w.get_op()}  last_err=0x{w.get_err():08X}")
-    try:
-        serial = _sanitize_slug((dev.serial_number or "").strip()) or "noserial"
-    except Exception:
-        serial = "noserial"
+    serial = _sanitize_slug(w.get_serial()) or "noserial"
+    print(f"      serial={serial}")
 
     # 2. Read both firmware-related subcmds:
     #      sub00 -> Bank A (factory/rescue, KeyA)
