@@ -1,0 +1,6 @@
+# Extended dependencies for measure_fps.py (capture + validation)
+# Includes everything in requirements.txt plus numpy and Pillow for
+# frame capture and PNG output.
+pyusb>=1.2.1
+numpy>=1.24
+Pillow>=9.0

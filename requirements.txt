@@ -1,0 +1,2 @@
+# Core dependency for seek18hz_unlock.py
+pyusb>=1.2.1
