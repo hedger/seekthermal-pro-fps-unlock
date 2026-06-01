@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import struct
 import sys
 import time
@@ -268,6 +269,44 @@ def format_firmware_info(raw: bytes) -> str:
             build = f"{date_str} {time_str}".strip() if time_str else date_str
             parts.append(f"build={build}")
     return "  ".join(parts) if parts else f"raw={raw[:16].hex()}"
+
+
+# ============================================================================
+# Artifact saving helpers
+# ============================================================================
+def _sanitize_slug(s: str, maxlen: int = 20) -> str:
+    """Return a filename-safe version of s, truncated to maxlen characters."""
+    return re.sub(r'[^A-Za-z0-9._-]', '_', s)[:maxlen]
+
+
+def _firmware_slug(fw_info: bytes) -> str:
+    """Extract a compact version string from fw_info bytes for use in filenames."""
+    if len(fw_info) >= 4:
+        v = fw_info[0:4]
+        if any(b not in (0x00, 0xFF) for b in v):
+            return f"v{v[0]}.{v[1]}.{v[2]}.{v[3]}"
+    return "vunknown"
+
+
+def _unique_path(p: Path) -> Path:
+    """Return p if it does not exist, else append a _NNN counter until free."""
+    if not p.exists():
+        return p
+    parent, stem, suffix = p.parent, p.stem, p.suffix
+    n = 1
+    while True:
+        candidate = parent / f"{stem}_{n:03d}{suffix}"
+        if not candidate.exists():
+            return candidate
+        n += 1
+
+
+def save_artifact(slug: str, kind: str, data: bytes) -> Path:
+    """Write data to seek_<slug>_<kind>.bin in the current directory.
+    Never clobbers an existing file — appends _001, _002 ... if needed."""
+    p = _unique_path(Path(f"seek_{slug}_{kind}.bin"))
+    p.write_bytes(data)
+    return p
 
 
 def open_device() -> "usb.core.Device":
@@ -557,20 +596,29 @@ def run(args: argparse.Namespace) -> int:
     dev = open_device()
     w = Wire(dev)
     print(f"      op_mode={w.get_op()}  last_err=0x{w.get_err():08X}")
+    try:
+        serial = _sanitize_slug((dev.serial_number or "").strip()) or "noserial"
+    except Exception:
+        serial = "noserial"
 
     # 2. Read both firmware-related subcmds:
     #      sub00 -> Bank A (factory/rescue, KeyA)
     #      sub08 -> Bank B (active upgrade target, KeyB after device write)
     print(f"\n[2/6] Reading firmware banks ({READ_CAP} B each) ...")
+    fw_info = w.get_firmware_info()
+    slug = f"{serial}_{_firmware_slug(fw_info)}"
     enc_a = dump_main_slot(w, subcmd=SUBCMD_MAIN_FW)
     enc_b = dump_main_slot(w, subcmd=SUBCMD_ACTIVE_FW)
     print(f"      Bank A (sub00) head = {enc_a[:8].hex()}  ({len(enc_a)} B)")
     print(f"      Bank B (sub08) head = {enc_b[:8].hex()}  ({len(enc_b)} B)")
+    art = save_artifact(slug, "bankA_raw", enc_a)
+    print(f"      Saved: {art}")
+    art = save_artifact(slug, "bankB_raw", enc_b)
+    print(f"      Saved: {art}")
 
     # 3. Check Bank B first — that's where the device actually boots from
     #    after a successful upgrade. Bank A is the factory rescue.
     print("\n[3/6] Decrypting and checking patch status ...")
-    fw_info = w.get_firmware_info()
     print(f"      Firmware info:  {format_firmware_info(fw_info)}")
     status_b, meta_b = status_string(enc_b)
     status_a, meta_a = status_string(enc_a)
@@ -580,6 +628,12 @@ def run(args: argparse.Namespace) -> int:
     print(f"      Bank A status: {status_a.upper()}  (key={meta_a.get('key','?')})")
     if status_a != "unknown":
         print(f"        enable={meta_a.get('enable_byte')}  comp={meta_a.get('comp_byte')}")
+    try:
+        _, _, _plain_a = detect_key(enc_a)
+        art = save_artifact(slug, "bankA_plain", _plain_a)
+        print(f"      Saved: {art}")
+    except ValueError:
+        pass
 
     # The authoritative state is Bank B (the live boot bank after first upgrade).
     status = status_b
@@ -616,6 +670,10 @@ def run(args: argparse.Namespace) -> int:
     if rt != patched_plain:
         sys.stderr.write("ERROR: cipher round-trip failed; aborting.\n")
         return 2
+    art = save_artifact(slug, "patched_plain", patched_plain)
+    print(f"      Saved: {art}")
+    art = save_artifact(slug, "patched_enc", patched_enc)
+    print(f"      Saved: {art}")
 
     # 5. Either dry-run or commit
     print("\n[5/6] " + ("DRY RUN — not writing." if not args.commit else "Uploading to device ..."))
