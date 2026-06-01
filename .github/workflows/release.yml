@@ -1,8 +1,10 @@
 name: Release binaries
 
 # Runs on every version tag push (e.g. v1.0.0).
-# Produces standalone single-file executables for Linux, macOS (Intel +
-# Apple Silicon), and Windows, then attaches them to the GitHub Release.
+# Produces standalone single-file executables for Linux, macOS (arm64), and
+# Windows, then attaches them to the GitHub Release.
+# macOS Intel (x86_64) is not built separately; the arm64 binary runs on
+# Intel Macs under Rosetta 2.
 #
 # Runtime libusb requirements:
 #   macOS  : brew install libusb
@@ -29,11 +31,7 @@ jobs:
             label: linux-x86_64
             exe_suffix: ''
 
-          - os: macos-13          # Intel runner
-            label: macos-x86_64
-            exe_suffix: ''
-
-          - os: macos-latest      # Apple Silicon (M-series) runner
+          - os: macos-latest      # arm64 (Apple Silicon / M-series)
             label: macos-arm64
             exe_suffix: ''
 
@@ -44,9 +42,9 @@ jobs:
     runs-on: ${{ matrix.os }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
         with:
           python-version: '3.12'
 
@@ -83,7 +81,7 @@ jobs:
             $EXTRA measure_fps.py
 
       - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: binaries-${{ matrix.label }}
           path: |
@@ -97,7 +95,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
         with:
           path: dist
           merge-multiple: true
@@ -105,7 +103,7 @@ jobs:
       - name: List artifacts
         run: ls -lh dist/
 
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda  # v3.0.0
         with:
           generate_release_notes: true
           files: dist/**
