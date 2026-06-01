@@ -9,26 +9,21 @@ single byte in a hardware-profile table; this repository provides a
 tool to flip that byte in-place and a second tool to measure the
 resulting streaming rate.
 
-> ⚠️ Reverse-engineering project. **Use at your own risk.** May void
-> warranty. Tested on **one** Compact PRO unit (firmware revision
-> `magic=0xA1B2C3D4 length=54840`). Run the dry-run first — it will
-> confirm whether your firmware matches before touching anything.
+> ⚠️ Reverse-engineering project. **Use at your own risk.** Will void warranty. Run the dry-run first — it will confirm whether your firmware matches before touching anything.
 
 ---
 
-## Contents
 
-| File | Purpose |
-|---|---|
-| [`seek18hz_unlock.py`](seek18hz_unlock.py) | Flash-level 18 Hz unlock. Safe dry-run by default. |
-| [`measure_fps.py`](measure_fps.py) | Measure actual streaming frame rate via USB bulk endpoint. |
-| [`requirements.txt`](requirements.txt) | Minimal deps for the unlock tool (`pyusb` only). |
-| [`requirements-capture.txt`](requirements-capture.txt) | Extended deps for unlock + capture/validation (`pyusb`, `numpy`, `Pillow`). |
-| [`FINDINGS.md`](FINDINGS.md) | Full RE writeup: flash layout, cipher, USB protocol, patch derivation. |
-
----
 
 ## Quick start
+
+### Easy Way
+
+Just download the latest pre-built binaries from the Releases page and run it with the device connected. It will perform the unlock and print the status. 
+
+Note that **on Windows** you may need to install the WinUSB driver for the device via [Zadig](https://zadig.akeo.ie), and on Linux you may need to set up a udev rule for non-root access.
+
+### Development Environment
 
 ```sh
 # Install system libusb (see Platform notes below), then create a venv:
@@ -192,8 +187,7 @@ PNG of the last thermal ROI to `/tmp/seek_stream_fps_test.png`.
   Then: `sudo udevadm control --reload-rules && sudo udevadm trigger`
 
 - **Windows**: install **WinUSB** for the device via
-  [Zadig](https://zadig.akeo.ie) (replaces the Seek vendor driver).
-  Seek's official software will not work while WinUSB is active.
+  [Zadig](https://zadig.akeo.ie).
 
   > The pre-built Windows `.exe` bundles `libusb-1.0.dll` — no separate
   > libusb installation is needed. WinUSB/Zadig is still required to give
