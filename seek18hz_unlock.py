@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 hedger <hedger@nanode.su>
 """
 seek18hz_unlock.py
 ==================
@@ -501,7 +503,8 @@ def status_string(enc_slot: bytes) -> tuple[str, dict]:
 
 
 def run(args: argparse.Namespace) -> int:
-    print("Seek Compact PRO 18 Hz unlock")
+    print("=" * 60)
+    print("Seek Thermal Compact PRO FPS Unlock - by hedger, https://github.com/hedger")
     print("=" * 60)
 
     # 1. Open device

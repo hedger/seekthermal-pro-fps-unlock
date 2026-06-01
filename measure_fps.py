@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 hedger <hedger@nanode.su>
 """Measure actual frame rate from the Seek Compact PRO thermal camera.
 
 Protocol (from libseek-thermal SeekCam.cpp / SeekThermalPro.cpp):
@@ -147,6 +149,10 @@ def save_frame_png(raw: bytes, path: Path):
 
 # ── main ──────────────────────────────────────────────────────────────────────
 def main() -> int:
+    print("=" * 60)
+    print("Seek Thermal Compact PRO - FPS bench - by hedger, https://github.com/hedger")
+    print("=" * 60)
+
     dev = usb.core.find(idVendor=VID, idProduct=PID)
     if dev is None:
         sys.stderr.write(
@@ -159,8 +165,6 @@ def main() -> int:
     except usb.core.USBError:
         pass
 
-    print("Seek Compact PRO — frame-rate measurement")
-    print("=" * 60)
     print(f"  RAW={RAW_W}×{RAW_H}  frame={FRAME_BYTES}B  chunks={N_CHUNKS}×{CHUNK}B")
     print(f"  initial opmode = {get_opmode(dev)}  err = 0x{get_err(dev):08X}")
 
