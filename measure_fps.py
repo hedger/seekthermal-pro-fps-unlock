@@ -25,11 +25,17 @@ RAW geometry (from SeekThermalPro.h):
 
 from __future__ import annotations
 
+import os
 import struct
 import sys
 import time
 from pathlib import Path
 from typing import Optional
+
+# PyInstaller + Windows: add the bundle temp dir to the DLL search path so
+# the bundled libusb-1.0.dll is found by ctypes when usb.core initialises.
+if sys.platform == "win32" and getattr(sys, "frozen", False):
+    os.add_dll_directory(sys._MEIPASS)  # type: ignore[attr-defined]
 
 try:
     import usb.core

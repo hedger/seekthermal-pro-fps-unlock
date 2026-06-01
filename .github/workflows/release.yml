@@ -4,11 +4,11 @@ name: Release binaries
 # Produces standalone single-file executables for Linux, macOS (Intel +
 # Apple Silicon), and Windows, then attaches them to the GitHub Release.
 #
-# NOTE: the binaries still require a system libusb installation at runtime:
+# Runtime libusb requirements:
 #   macOS  : brew install libusb
 #   Linux  : apt install libusb-1.0-0
-#   Windows: the WinUSB driver installed via Zadig (no extra DLL needed
-#            when using libusb-win32 / WinUSB backend)
+#   Windows: libusb-1.0.dll is bundled in the .exe; only the WinUSB device
+#            driver (Zadig) is needed for USB access to the camera.
 
 on:
   push:
@@ -56,17 +56,31 @@ jobs:
           pip install -r requirements-capture.txt
           pip install pyinstaller
 
+      - name: Download libusb-1.0.dll (Windows only)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          curl -fsSL -o libusb.7z \
+            https://github.com/libusb/libusb/releases/download/v1.0.27/libusb-1.0.27-binaries.7z
+          7z e libusb.7z VS2022/MS64/dll/libusb-1.0.dll -o. -y
+
       - name: Build seek18hz_unlock
-        run: >
-          pyinstaller --onefile --clean
-          --name seek18hz_unlock-${{ matrix.label }}
-          seek18hz_unlock.py
+        shell: bash
+        run: |
+          EXTRA=""
+          [ "$RUNNER_OS" = "Windows" ] && EXTRA="--add-binary libusb-1.0.dll;."
+          pyinstaller --onefile --clean \
+            --name seek18hz_unlock-${{ matrix.label }} \
+            $EXTRA seek18hz_unlock.py
 
       - name: Build measure_fps
-        run: >
-          pyinstaller --onefile --clean
-          --name measure_fps-${{ matrix.label }}
-          measure_fps.py
+        shell: bash
+        run: |
+          EXTRA=""
+          [ "$RUNNER_OS" = "Windows" ] && EXTRA="--add-binary libusb-1.0.dll;."
+          pyinstaller --onefile --clean \
+            --name measure_fps-${{ matrix.label }} \
+            $EXTRA measure_fps.py
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4

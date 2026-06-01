@@ -195,6 +195,10 @@ PNG of the last thermal ROI to `/tmp/seek_stream_fps_test.png`.
   [Zadig](https://zadig.akeo.ie) (replaces the Seek vendor driver).
   Seek's official software will not work while WinUSB is active.
 
+  > The pre-built Windows `.exe` bundles `libusb-1.0.dll` — no separate
+  > libusb installation is needed. WinUSB/Zadig is still required to give
+  > libusb access to the camera itself.
+
 ### Requirement sets
 
 | File | Installs | Use when |
