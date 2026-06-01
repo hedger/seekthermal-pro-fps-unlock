@@ -72,6 +72,7 @@ BMREQ_IN  = 0xC1   # vendor | interface | IN
 OP_GET_ERROR_CODE             = 0x35
 OP_SET_OPERATION_MODE         = 0x3C
 OP_GET_OPERATION_MODE         = 0x3D
+OP_GET_FIRMWARE_INFO          = 0x4E  # IN  — firmware version + build date
 OP_GET_FEATURED_FIRMWARE_DATA = 0x4F  # IN  — read upgrade window
 OP_SET_FEATURED_FIRMWARE_DATA = 0x50  # OUT — write upgrade chunk
 OP_COMPLETE_MEMORY_UPGRADE    = 0x51  # OUT — verify+commit (u16 checksum)
@@ -197,6 +198,12 @@ class Wire:
     def inn(self, op: int, length: int, timeout: int = 5000) -> bytes:
         return bytes(self.dev.ctrl_transfer(BMREQ_IN, op, 0, 0, length, timeout))
 
+    def get_firmware_info(self) -> bytes:
+        try:
+            return self.inn(OP_GET_FIRMWARE_INFO, 64)
+        except Exception:
+            return b""
+
     def get_err(self) -> int:
         return int.from_bytes(self.inn(OP_GET_ERROR_CODE, 4), "little")
 
@@ -223,6 +230,41 @@ class Wire:
             self.out(OP_RESET_DEVICE, b"", timeout=2000)
         except Exception:
             pass  # device drops mid-transaction during reset
+
+
+def format_firmware_info(raw: bytes) -> str:
+    """Parse the GetFirmwareInfo (0x4E) response into a human-readable string.
+
+    Observed layout (44-byte response on current firmware):
+      +0x00  u32 LE  build timestamp (seconds, custom epoch — displayed as hex)
+      +0x04  u8[4]   version  byte[0].byte[1].byte[2].byte[3]  (e.g. 4.9.2.0)
+      +0x08  u32 LE  reset-vector copy (0x10000409)
+      +0x0C..  zeros
+    There is no embedded ASCII date; the timestamp is opaque.
+    """
+    if not raw:
+        return "(unavailable)"
+    import re
+    parts = []
+    # Version: 4 bytes at offset 4
+    if len(raw) >= 8:
+        v = raw[4:8]
+        # Skip all-zero or all-FF version fields
+        if any(b not in (0x00, 0xFF) for b in v):
+            parts.append(f"ver={v[0]}.{v[1]}.{v[2]}.{v[3]}")
+    # Timestamp at offset 0
+    if len(raw) >= 4:
+        ts = struct.unpack_from("<I", raw, 0)[0]
+        if ts:
+            parts.append(f"ts=0x{ts:08X}")
+    # Scan for any embedded ASCII string (build date, tag, etc.)
+    m = re.search(rb'[\x20-\x7e]{6,}', raw[12:])
+    if m:
+        try:
+            parts.append(f"str={m.group(0).rstrip(b'\x00').decode('ascii')}")
+        except Exception:
+            pass
+    return "  ".join(parts) if parts else f"raw={raw[:16].hex()}"
 
 
 def open_device() -> "usb.core.Device":
@@ -525,6 +567,8 @@ def run(args: argparse.Namespace) -> int:
     # 3. Check Bank B first — that's where the device actually boots from
     #    after a successful upgrade. Bank A is the factory rescue.
     print("\n[3/6] Decrypting and checking patch status ...")
+    fw_info = w.get_firmware_info()
+    print(f"      Firmware info:  {format_firmware_info(fw_info)}")
     status_b, meta_b = status_string(enc_b)
     status_a, meta_a = status_string(enc_a)
     print(f"      Bank B status: {status_b.upper()}  (key={meta_b.get('key','?')})")
