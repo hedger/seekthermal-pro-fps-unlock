@@ -39,6 +39,7 @@ import re
 import struct
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 # PyInstaller + Windows: add the bundle temp dir to the DLL search path so
@@ -199,11 +200,11 @@ class Wire:
     def inn(self, op: int, length: int, timeout: int = 5000) -> bytes:
         return bytes(self.dev.ctrl_transfer(BMREQ_IN, op, 0, 0, length, timeout))
 
-    def get_firmware_info(self) -> bytes:
+    def get_firmware_info(self) -> "FirmwareInfo":
         try:
-            return self.inn(OP_GET_FIRMWARE_INFO, 64)
+            return FirmwareInfo.from_bytes(self.inn(OP_GET_FIRMWARE_INFO, 64))
         except Exception:
-            return b""
+            return FirmwareInfo()
 
     def get_err(self) -> int:
         return int.from_bytes(self.inn(OP_GET_ERROR_CODE, 4), "little")
@@ -233,42 +234,66 @@ class Wire:
             pass  # device drops mid-transaction during reset
 
 
-def format_firmware_info(raw: bytes) -> str:
-    """Parse the GetFirmwareInfo (0x4E) response into a human-readable string.
+# ============================================================================
+# Domain data structures
+# ============================================================================
+@dataclass
+class FirmwareInfo:
+    """Parsed GetFirmwareInfo (0x4E) response from the camera.
 
-    Confirmed layout (36-byte response, verified against live device and
-    decrypted firmware binary):
+    On-wire layout (36 B, confirmed on live device and decrypted binary):
       +0x00  u8[4]   version  major.minor.patch.build  (e.g. 4.9.1.15)
-      +0x04  char[]  __DATE__ null-terminated (11 chars, e.g. "Mar 14 2019")
-      +0x10  char[]  __TIME__ null-terminated (8 chars, e.g. "09:18:41")
-                     (zero-padded to align; date null + pad brings time to +0x14)
+      +0x04  char[]  __DATE__ null-terminated (e.g. "Mar 14 2019")
+      +0x10  char[]  __TIME__ null-terminated (e.g. "09:18:41")
     """
-    if not raw:
-        return "(unavailable)"
-    parts = []
-    # [0..3]: binary version as four u8s
-    if len(raw) >= 4:
-        v = raw[0:4]
-        if any(b not in (0x00, 0xFF) for b in v):
-            parts.append(f"ver={v[0]}.{v[1]}.{v[2]}.{v[3]}")
-    # [4..]: null-terminated __DATE__, then (after zeros) null-terminated __TIME__
-    if len(raw) > 4:
-        rest = raw[4:]
-        end1 = rest.find(b'\x00')
-        date_bytes = rest[:end1] if end1 >= 0 else rest
-        date_str = date_bytes.decode('ascii', errors='replace').strip()
-        if date_str:
-            # Skip null(s)/padding to reach __TIME__
-            after = rest[end1 + 1:] if end1 >= 0 else b''
-            start2 = 0
-            while start2 < len(after) and after[start2] == 0:
-                start2 += 1
-            end2 = after.find(b'\x00', start2)
-            time_bytes = after[start2:end2] if end2 >= 0 else after[start2:]
-            time_str = time_bytes.decode('ascii', errors='replace').strip()
-            build = f"{date_str} {time_str}".strip() if time_str else date_str
-            parts.append(f"build={build}")
-    return "  ".join(parts) if parts else f"raw={raw[:16].hex()}"
+    version: tuple[int, int, int, int] = (0, 0, 0, 0)
+    build_date: str = ""
+    build_time: str = ""
+
+    @classmethod
+    def from_bytes(cls, raw: bytes) -> "FirmwareInfo":
+        """Parse the 0x4E response bytes. Returns a default instance on failure."""
+        version: tuple[int, int, int, int] = (0, 0, 0, 0)
+        build_date = build_time = ""
+        if len(raw) >= 4:
+            v = raw[0:4]
+            if any(b not in (0x00, 0xFF) for b in v):
+                version = (v[0], v[1], v[2], v[3])
+        if len(raw) > 4:
+            rest = raw[4:]
+            end1 = rest.find(b'\x00')
+            date_bytes = rest[:end1] if end1 >= 0 else rest
+            build_date = date_bytes.decode('ascii', errors='replace').strip()
+            if build_date and end1 >= 0:
+                after = rest[end1 + 1:]
+                start2 = next((i for i, b in enumerate(after) if b != 0), len(after))
+                end2 = after.find(b'\x00', start2)
+                time_bytes = after[start2:end2] if end2 >= 0 else after[start2:]
+                build_time = time_bytes.decode('ascii', errors='replace').strip()
+        return cls(version=version, build_date=build_date, build_time=build_time)
+
+    @property
+    def version_str(self) -> str:
+        return ".".join(str(v) for v in self.version)
+
+    @property
+    def slug(self) -> str:
+        """Filename-safe version string, e.g. 'v4.9.1.15'."""
+        if any(v not in (0, 0xFF) for v in self.version):
+            return f"v{self.version_str}"
+        return "vunknown"
+
+    @property
+    def build(self) -> str:
+        return f"{self.build_date} {self.build_time}".strip()
+
+    def __str__(self) -> str:
+        parts = []
+        if any(v not in (0, 0xFF) for v in self.version):
+            parts.append(f"ver={self.version_str}")
+        if self.build:
+            parts.append(f"build={self.build}")
+        return "  ".join(parts) if parts else "(unavailable)"
 
 
 # ============================================================================
@@ -277,15 +302,6 @@ def format_firmware_info(raw: bytes) -> str:
 def _sanitize_slug(s: str, maxlen: int = 20) -> str:
     """Return a filename-safe version of s, truncated to maxlen characters."""
     return re.sub(r'[^A-Za-z0-9._-]', '_', s)[:maxlen]
-
-
-def _firmware_slug(fw_info: bytes) -> str:
-    """Extract a compact version string from fw_info bytes for use in filenames."""
-    if len(fw_info) >= 4:
-        v = fw_info[0:4]
-        if any(b not in (0x00, 0xFF) for b in v):
-            return f"v{v[0]}.{v[1]}.{v[2]}.{v[3]}"
-    return "vunknown"
 
 
 def _unique_path(p: Path) -> Path:
@@ -429,161 +445,156 @@ def wait_for_reenum(timeout_s: float = 20.0) -> "usb.core.Device":
 # ============================================================================
 # Patch logic
 # ============================================================================
-def detect_key(enc: bytes) -> tuple[str, bytes, bytes]:
-    """Try KeyA and KeyB. Prefer the key that yields a VALID checksum
-    (sum-of-u32 == 0xFFFF over the declared length). The header magic
-    alone is not a reliable discriminator because the cipher leaves
-    bytes [512..575] verbatim, so any encryption (even with the wrong
-    key) appears to "match" the magic. Fall back to whichever key
-    produces a valid header length if neither validates."""
-    candidates = []
-    for name, k in (("KeyA", KEY_A), ("KeyB", KEY_B)):
-        dec = crypt(enc, k)
-        magic = struct.unpack_from("<I", dec, HEADER_OFFS)[0]
-        if magic != HEADER_MAGIC:
-            continue
-        length = struct.unpack_from("<I", dec, HEADER_OFFS + 4)[0]
-        if not (0 < length <= len(dec)):
-            continue
-        csum_ok = (checksum(dec[:length]) == 0xFFFF)
-        candidates.append((csum_ok, name, k, dec))
-    # Prefer validated; else any candidate; else fail.
-    candidates.sort(key=lambda c: not c[0])  # True first
-    if not candidates:
-        raise ValueError(
-            f"neither KeyA nor KeyB decrypts to magic 0x{HEADER_MAGIC:08X} "
-            "with a valid header length."
-        )
-    _, name, k, dec = candidates[0]
-    return name, k, dec
-
-
-def find_rec20(plain: bytes) -> int:
+def _find_rec20(plain: bytes) -> int:
     """Locate rec[20] by masked signature (byte 3 = enable, wildcarded).
     Works on both factory and patched firmware."""
     hits = []
     i = 0
-    head_len = len(REC20_SIG_HEAD)         # 3
-    tail_off = head_len + 1                # skip enable byte (offset 3)
+    tail_off = len(REC20_SIG_HEAD) + 1     # skip enable byte at offset 3
     while True:
         j = plain.find(REC20_SIG_HEAD, i)
         if j < 0:
             break
         i = j + 1
-        # require tail to match at the wildcarded position
         if plain[j + tail_off:j + tail_off + len(REC20_SIG_TAIL)] == REC20_SIG_TAIL:
             hits.append(j)
     if not hits:
         raise ValueError(
             f"rec[20] signature {REC20_SIG_HEAD.hex()}??{REC20_SIG_TAIL.hex()} "
-            "NOT FOUND. Firmware layout differs from what this script knows about — "
-            "refuse to patch."
+            "NOT FOUND — firmware layout differs from expected."
         )
     if len(hits) > 1:
         raise ValueError(
-            f"rec[20] signature is ambiguous (found at {[hex(h) for h in hits]}); "
-            "refusing to guess which one to patch."
+            f"rec[20] signature ambiguous (found at {[hex(h) for h in hits]})."
         )
     return hits[0]
 
 
-def patch_plain(plain: bytes) -> tuple[bytes, dict]:
-    """Apply 18 Hz unlock + checksum compensation to plaintext image.
-    Returns (patched, info)."""
-    buf = bytearray(plain)
-    rec20 = find_rec20(bytes(buf))
-    enable_off = rec20 + REC20_ENABLE_OFF
-    comp_off   = rec20 + REC20_COMP_OFF
-    if buf[enable_off] != 0x00:
-        raise ValueError(
-            f"rec[20] enable byte at 0x{enable_off:04X} is "
-            f"0x{buf[enable_off]:02X}, expected 0x00 (= 18 Hz disabled). "
-            "Either already patched, or layout unexpected."
-        )
-    if buf[comp_off] != 0x00:
-        raise ValueError(
-            f"checksum compensator byte at 0x{comp_off:04X} is "
-            f"0x{buf[comp_off]:02X}, expected 0x00. Refusing to overwrite."
-        )
-    buf[enable_off] = PATCH_ENABLE_NEW
-    buf[comp_off]   = PATCH_COMP_NEW
-    return bytes(buf), {
-        "rec20_off": rec20,
-        "enable_off": enable_off,
-        "comp_off": comp_off,
-    }
+@dataclass
+class FirmwareImage:
+    """A validated, decrypted firmware image with its structural metadata.
 
+    Construct with FirmwareImage.from_encrypted() from a raw flash slot.
+    Call .patch() to produce an 18 Hz-unlocked copy, .encrypt() to re-encrypt.
+    """
+    data: bytes             # full plaintext bytes
+    key_name: str           # "KeyA" or "KeyB" — key that decrypted this image
+    magic: int              # header magic word
+    length: int             # declared plaintext length (used for checksum)
+    sp: int                 # initial stack pointer (vector table[0])
+    reset: int              # reset handler address (vector table[1])
+    csum: int               # sum-of-u32 over data[:length]
+    rec20_off: int          # byte offset of rec[20] in data
+    enable_byte: int        # current 18 Hz enable flag (0x00 or 0x01)
+    comp_byte: int          # current checksum-compensator byte value
 
-def validate_plain(plain: bytes, *, expect_patched: bool) -> dict:
-    """Validate a plaintext firmware image. Returns metadata dict.
-    Raises ValueError on any invariant violation."""
-    if len(plain) < HEADER_OFFS + 8:
-        raise ValueError(f"image too small: {len(plain)} B")
-    magic, length = struct.unpack_from("<2I", plain, HEADER_OFFS)
-    if magic != HEADER_MAGIC:
-        raise ValueError(f"bad magic 0x{magic:08X} (expected 0x{HEADER_MAGIC:08X})")
-    if not (0 < length <= len(plain)):
-        raise ValueError(f"bad header length {length} (image is {len(plain)} B)")
-    sp, reset = struct.unpack_from("<2I", plain, 0)
-    if sp != 0x10020000:
-        raise ValueError(f"vector SP=0x{sp:08X}, expected 0x10020000")
-    if not (RAM_LO <= reset <= RAM_HI):
-        raise ValueError(f"vector Reset=0x{reset:08X} not in RAM")
-    csum = checksum(plain[:length])
-    if csum != 0xFFFF:
-        raise ValueError(f"checksum sum-of-u32 = 0x{csum:08X}, expected 0x0000FFFF")
-    rec20 = find_rec20(plain)
-    enable = plain[rec20 + REC20_ENABLE_OFF]
-    comp   = plain[rec20 + REC20_COMP_OFF]
-    if expect_patched:
-        if enable != PATCH_ENABLE_NEW:
+    # ------------------------------------------------------------------ #
+    # Deserialization                                                      #
+    # ------------------------------------------------------------------ #
+    @classmethod
+    def from_encrypted(cls, enc: bytes) -> "FirmwareImage":
+        """Decrypt *enc* with KeyA then KeyB, validate structure, return an instance.
+        Prefers the key whose decryption passes the checksum invariant.
+        Raises ValueError if no valid image can be decoded."""
+        candidates = []
+        for key_name, key in (("KeyA", KEY_A), ("KeyB", KEY_B)):
+            plain = crypt(enc, key)
+            magic = struct.unpack_from("<I", plain, HEADER_OFFS)[0]
+            if magic != HEADER_MAGIC:
+                continue
+            length = struct.unpack_from("<I", plain, HEADER_OFFS + 4)[0]
+            if not (0 < length <= len(plain)):
+                continue
+            csum = checksum(plain[:length])
+            candidates.append((csum == 0xFFFF, key_name, plain, magic, length, csum))
+        candidates.sort(key=lambda c: not c[0])  # checksum-valid first
+        if not candidates:
             raise ValueError(
-                f"expected patched: byte at 0x{rec20+REC20_ENABLE_OFF:04X} = "
-                f"0x{enable:02X}, expected 0x{PATCH_ENABLE_NEW:02X}"
+                f"neither KeyA nor KeyB decrypts to magic 0x{HEADER_MAGIC:08X}."
             )
-        if comp != PATCH_COMP_NEW:
+        csum_ok, key_name, plain, magic, length, csum = candidates[0]
+        sp, reset = struct.unpack_from("<2I", plain, 0)
+        if sp != 0x10020000:
+            raise ValueError(f"vector SP=0x{sp:08X}, expected 0x10020000")
+        if not (RAM_LO <= reset <= RAM_HI):
+            raise ValueError(f"vector Reset=0x{reset:08X} not in RAM")
+        if not csum_ok:
+            raise ValueError(f"checksum 0x{csum:08X} != 0x0000FFFF")
+        rec20_off = _find_rec20(plain)
+        return cls(
+            data=plain,
+            key_name=key_name,
+            magic=magic,
+            length=length,
+            sp=sp,
+            reset=reset,
+            csum=csum,
+            rec20_off=rec20_off,
+            enable_byte=plain[rec20_off + REC20_ENABLE_OFF],
+            comp_byte=plain[rec20_off + REC20_COMP_OFF],
+        )
+
+    # ------------------------------------------------------------------ #
+    # Serialization                                                        #
+    # ------------------------------------------------------------------ #
+    def encrypt(self, key: bytes = KEY_A) -> bytes:
+        """Re-encrypt this image with *key* and return the encrypted slot bytes."""
+        return crypt(self.data, key)
+
+    # ------------------------------------------------------------------ #
+    # State properties                                                     #
+    # ------------------------------------------------------------------ #
+    @property
+    def enable_off(self) -> int:
+        """Absolute byte offset of the 18 Hz enable flag in data."""
+        return self.rec20_off + REC20_ENABLE_OFF
+
+    @property
+    def comp_off(self) -> int:
+        """Absolute byte offset of the checksum-compensator byte in data."""
+        return self.rec20_off + REC20_COMP_OFF
+
+    @property
+    def status(self) -> str:
+        """'patched', 'unpatched', or 'unknown'."""
+        if self.enable_byte == 0x00 and self.comp_byte == 0x00:
+            return "unpatched"
+        if self.enable_byte == PATCH_ENABLE_NEW and self.comp_byte == PATCH_COMP_NEW:
+            return "patched"
+        return "unknown"
+
+    # ------------------------------------------------------------------ #
+    # Mutation                                                             #
+    # ------------------------------------------------------------------ #
+    def patch(self) -> "FirmwareImage":
+        """Return a new FirmwareImage with the 18 Hz unlock applied.
+        Raises ValueError if not in the expected factory (unpatched) state."""
+        if self.enable_byte != 0x00:
             raise ValueError(
-                f"expected patched: compensator at 0x{rec20+REC20_COMP_OFF:04X} "
-                f"= 0x{comp:02X}, expected 0x{PATCH_COMP_NEW:02X}"
+                f"enable byte at 0x{self.enable_off:04X} = 0x{self.enable_byte:02X}; "
+                "expected 0x00 (18 Hz disabled). Already patched or layout changed."
             )
-    return {
-        "magic": magic,
-        "length": length,
-        "sp": sp,
-        "reset": reset,
-        "csum": csum,
-        "rec20_off": rec20,
-        "enable_byte": enable,
-        "comp_byte": comp,
-    }
-
-
-# ============================================================================
-# Status / patch flow
-# ============================================================================
-def status_string(enc_slot: bytes) -> tuple[str, dict]:
-    """Return (status_str, meta). status_str ∈ {'unpatched','patched','unknown'}.
-    Discriminates on the actual rec[20] enable byte and the checksum
-    compensator value, not just structural validity."""
-    try:
-        kname, _key, plain = detect_key(enc_slot)
-    except ValueError as e:
-        return "unknown", {"error": str(e)}
-    try:
-        meta = validate_plain(plain, expect_patched=False)
-    except ValueError as e:
-        return "unknown", {"key": kname, "error": str(e)}
-    enable = meta["enable_byte"]
-    comp = meta["comp_byte"]
-    if enable == 0x00 and comp == 0x00:
-        return "unpatched", {"key": kname, **meta}
-    if enable == PATCH_ENABLE_NEW and comp == PATCH_COMP_NEW:
-        return "patched", {"key": kname, **meta}
-    return "unknown", {
-        "key": kname,
-        "error": f"unexpected enable=0x{enable:02X} comp=0x{comp:02X}",
-        **meta,
-    }
+        if self.comp_byte != 0x00:
+            raise ValueError(
+                f"compensator at 0x{self.comp_off:04X} = 0x{self.comp_byte:02X}; "
+                "expected 0x00. Refusing to overwrite."
+            )
+        buf = bytearray(self.data)
+        buf[self.enable_off] = PATCH_ENABLE_NEW
+        buf[self.comp_off]   = PATCH_COMP_NEW
+        new_data = bytes(buf)
+        return FirmwareImage(
+            data=new_data,
+            key_name=self.key_name,
+            magic=self.magic,
+            length=self.length,
+            sp=self.sp,
+            reset=self.reset,
+            csum=checksum(new_data[:self.length]),
+            rec20_off=self.rec20_off,
+            enable_byte=PATCH_ENABLE_NEW,
+            comp_byte=PATCH_COMP_NEW,
+        )
 
 
 def run(args: argparse.Namespace) -> int:
@@ -606,7 +617,7 @@ def run(args: argparse.Namespace) -> int:
     #      sub08 -> Bank B (active upgrade target, KeyB after device write)
     print(f"\n[2/6] Reading firmware banks ({READ_CAP} B each) ...")
     fw_info = w.get_firmware_info()
-    slug = f"{serial}_{_firmware_slug(fw_info)}"
+    slug = f"{serial}_{fw_info.slug}"
     enc_a = dump_main_slot(w, subcmd=SUBCMD_MAIN_FW)
     enc_b = dump_main_slot(w, subcmd=SUBCMD_ACTIVE_FW)
     print(f"      Bank A (sub00) head = {enc_a[:8].hex()}  ({len(enc_a)} B)")
@@ -619,33 +630,35 @@ def run(args: argparse.Namespace) -> int:
     # 3. Check Bank B first — that's where the device actually boots from
     #    after a successful upgrade. Bank A is the factory rescue.
     print("\n[3/6] Decrypting and checking patch status ...")
-    print(f"      Firmware info:  {format_firmware_info(fw_info)}")
-    status_b, meta_b = status_string(enc_b)
-    status_a, meta_a = status_string(enc_a)
-    print(f"      Bank B status: {status_b.upper()}  (key={meta_b.get('key','?')})")
-    if status_b != "unknown":
-        print(f"        enable={meta_b.get('enable_byte')}  comp={meta_b.get('comp_byte')}")
-    print(f"      Bank A status: {status_a.upper()}  (key={meta_a.get('key','?')})")
-    if status_a != "unknown":
-        print(f"        enable={meta_a.get('enable_byte')}  comp={meta_a.get('comp_byte')}")
+    print(f"      Firmware info:  {fw_info}")
+    img_a: FirmwareImage | None = None
+    img_b: FirmwareImage | None = None
     try:
-        _, _, _plain_a = detect_key(enc_a)
-        art = save_artifact(slug, "bankA_plain", _plain_a)
+        img_b = FirmwareImage.from_encrypted(enc_b)
+        print(f"      Bank B: {img_b.status.upper()}  (key={img_b.key_name})"
+              f"  enable=0x{img_b.enable_byte:02X}  comp=0x{img_b.comp_byte:02X}")
+    except ValueError as e:
+        print(f"      Bank B: UNKNOWN  ({e})")
+    try:
+        img_a = FirmwareImage.from_encrypted(enc_a)
+        print(f"      Bank A: {img_a.status.upper()}  (key={img_a.key_name})"
+              f"  enable=0x{img_a.enable_byte:02X}  comp=0x{img_a.comp_byte:02X}")
+        art = save_artifact(slug, "bankA_plain", img_a.data)
         print(f"      Saved: {art}")
-    except ValueError:
-        pass
+    except ValueError as e:
+        print(f"      Bank A: UNKNOWN  ({e})")
 
     # The authoritative state is Bank B (the live boot bank after first upgrade).
-    status = status_b
-    if status == "patched":
+    status_b = img_b.status if img_b else "unknown"
+    if status_b == "patched":
         print("\nBank B is PATCHED — device is already unlocked. No action required.")
         return 0
-    if status == "unknown" and status_a == "unknown":
+    status_a = img_a.status if img_a else "unknown"
+    if status_b == "unknown" and status_a == "unknown":
         sys.stderr.write(
             "\nERROR: neither bank matches expected layout — refusing to patch.\n"
         )
         return 2
-    # Bank B is unpatched (or unknown); fall through to flashing using Bank A as plaintext source.
     if status_a != "unpatched":
         sys.stderr.write(
             f"\nERROR: Bank A is not in factory state (status={status_a}); refusing to patch.\n"
@@ -654,23 +667,20 @@ def run(args: argparse.Namespace) -> int:
 
     # 4. Patch in memory (from Bank A factory plaintext)
     print("\n[4/6] Patching plaintext + repairing checksum ...")
-    kname, key, plain = detect_key(enc_a)
-    patched_plain, info = patch_plain(plain)
-    pmeta = validate_plain(patched_plain, expect_patched=True)
-    print(f"      patched offsets: enable=0x{info['enable_off']:04X}  "
-          f"comp=0x{info['comp_off']:04X}")
+    assert img_a is not None
+    patched = img_a.patch()
+    assert patched.csum == 0xFFFF, f"post-patch checksum = 0x{patched.csum:08X}"
+    print(f"      patched offsets: enable=0x{patched.enable_off:04X}  "
+          f"comp=0x{patched.comp_off:04X}")
     print(f"      post-patch checksum (must be 0x0000FFFF): "
-          f"0x{pmeta['csum']:08X}")
-    assert pmeta["csum"] == 0xFFFF
-    # Re-encrypt with the SAME key we read with (upload-side key is always
-    # KeyA on factory devices; device may re-encrypt to KeyB internally).
-    patched_enc = crypt(patched_plain, KEY_A)
-    # Sanity: round-trip
-    rt = crypt(patched_enc, KEY_A)
-    if rt != patched_plain:
+          f"0x{patched.csum:08X}")
+    # Re-encrypt with KeyA (upload-side key; device may re-encrypt to KeyB internally).
+    patched_enc = patched.encrypt(KEY_A)
+    # Sanity: crypt is self-inverse — crypt(crypt(x)) == x.
+    if crypt(patched_enc, KEY_A) != patched.data:
         sys.stderr.write("ERROR: cipher round-trip failed; aborting.\n")
         return 2
-    art = save_artifact(slug, "patched_plain", patched_plain)
+    art = save_artifact(slug, "patched_plain", patched.data)
     print(f"      Saved: {art}")
     art = save_artifact(slug, "patched_enc", patched_enc)
     print(f"      Saved: {art}")
@@ -695,13 +705,17 @@ def run(args: argparse.Namespace) -> int:
     w2 = Wire(dev2)
     print(f"      device back  op_mode={w2.get_op()}  last_err=0x{w2.get_err():08X}")
     enc_b_after = dump_main_slot(w2, subcmd=SUBCMD_ACTIVE_FW)
-    status2, meta2 = status_string(enc_b_after)
-    print(f"      Bank B post-flash status: {status2.upper()}  "
-          f"(decrypted with {meta2.get('key', '?')})")
+    try:
+        img_b_after = FirmwareImage.from_encrypted(enc_b_after)
+        status2 = img_b_after.status
+        print(f"      Bank B post-flash: {status2.upper()}  (key={img_b_after.key_name})")
+    except ValueError as e:
+        status2 = "unknown"
+        print(f"      Bank B post-flash: UNKNOWN  ({e})")
     if status2 != "patched":
         sys.stderr.write(
             "\nERROR: post-flash Bank B does NOT confirm patched state.\n"
-            f"   status={status2}  meta={meta2}\n"
+            f"   status={status2}\n"
             "   Power-cycle the camera and re-run with no flags to recheck.\n"
         )
         return 3
