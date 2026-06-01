@@ -1,0 +1,97 @@
+name: Release binaries
+
+# Runs on every version tag push (e.g. v1.0.0).
+# Produces standalone single-file executables for Linux, macOS (Intel +
+# Apple Silicon), and Windows, then attaches them to the GitHub Release.
+#
+# NOTE: the binaries still require a system libusb installation at runtime:
+#   macOS  : brew install libusb
+#   Linux  : apt install libusb-1.0-0
+#   Windows: the WinUSB driver installed via Zadig (no extra DLL needed
+#            when using libusb-win32 / WinUSB backend)
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write   # needed to create the GitHub Release
+
+jobs:
+  build:
+    name: Build — ${{ matrix.label }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            label: linux-x86_64
+            exe_suffix: ''
+
+          - os: macos-13          # Intel runner
+            label: macos-x86_64
+            exe_suffix: ''
+
+          - os: macos-latest      # Apple Silicon (M-series) runner
+            label: macos-arm64
+            exe_suffix: ''
+
+          - os: windows-latest
+            label: windows-x86_64
+            exe_suffix: '.exe'
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-capture.txt
+          pip install pyinstaller
+
+      - name: Build seek18hz_unlock
+        run: >
+          pyinstaller --onefile --clean
+          --name seek18hz_unlock-${{ matrix.label }}
+          seek18hz_unlock.py
+
+      - name: Build measure_fps
+        run: >
+          pyinstaller --onefile --clean
+          --name measure_fps-${{ matrix.label }}
+          measure_fps.py
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: binaries-${{ matrix.label }}
+          path: |
+            dist/seek18hz_unlock-${{ matrix.label }}${{ matrix.exe_suffix }}
+            dist/measure_fps-${{ matrix.label }}${{ matrix.exe_suffix }}
+          if-no-files-found: error
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -lh dist/
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: dist/**
