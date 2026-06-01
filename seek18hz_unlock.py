@@ -235,35 +235,38 @@ class Wire:
 def format_firmware_info(raw: bytes) -> str:
     """Parse the GetFirmwareInfo (0x4E) response into a human-readable string.
 
-    Observed layout (44-byte response on current firmware):
-      +0x00  u32 LE  build timestamp (seconds, custom epoch — displayed as hex)
-      +0x04  u8[4]   version  byte[0].byte[1].byte[2].byte[3]  (e.g. 4.9.2.0)
-      +0x08  u32 LE  reset-vector copy (0x10000409)
-      +0x0C..  zeros
-    There is no embedded ASCII date; the timestamp is opaque.
+    Confirmed layout (36-byte response, verified against live device and
+    decrypted firmware binary):
+      +0x00  u8[4]   version  major.minor.patch.build  (e.g. 4.9.1.15)
+      +0x04  char[]  __DATE__ null-terminated (11 chars, e.g. "Mar 14 2019")
+      +0x10  char[]  __TIME__ null-terminated (8 chars, e.g. "09:18:41")
+                     (zero-padded to align; date null + pad brings time to +0x14)
     """
     if not raw:
         return "(unavailable)"
-    import re
     parts = []
-    # Version: 4 bytes at offset 4
-    if len(raw) >= 8:
-        v = raw[4:8]
-        # Skip all-zero or all-FF version fields
+    # [0..3]: binary version as four u8s
+    if len(raw) >= 4:
+        v = raw[0:4]
         if any(b not in (0x00, 0xFF) for b in v):
             parts.append(f"ver={v[0]}.{v[1]}.{v[2]}.{v[3]}")
-    # Timestamp at offset 0
-    if len(raw) >= 4:
-        ts = struct.unpack_from("<I", raw, 0)[0]
-        if ts:
-            parts.append(f"ts=0x{ts:08X}")
-    # Scan for any embedded ASCII string (build date, tag, etc.)
-    m = re.search(rb'[\x20-\x7e]{6,}', raw[12:])
-    if m:
-        try:
-            parts.append(f"str={m.group(0).rstrip(b'\x00').decode('ascii')}")
-        except Exception:
-            pass
+    # [4..]: null-terminated __DATE__, then (after zeros) null-terminated __TIME__
+    if len(raw) > 4:
+        rest = raw[4:]
+        end1 = rest.find(b'\x00')
+        date_bytes = rest[:end1] if end1 >= 0 else rest
+        date_str = date_bytes.decode('ascii', errors='replace').strip()
+        if date_str:
+            # Skip null(s)/padding to reach __TIME__
+            after = rest[end1 + 1:] if end1 >= 0 else b''
+            start2 = 0
+            while start2 < len(after) and after[start2] == 0:
+                start2 += 1
+            end2 = after.find(b'\x00', start2)
+            time_bytes = after[start2:end2] if end2 >= 0 else after[start2:]
+            time_str = time_bytes.decode('ascii', errors='replace').strip()
+            build = f"{date_str} {time_str}".strip() if time_str else date_str
+            parts.append(f"build={build}")
     return "  ".join(parts) if parts else f"raw={raw[:16].hex()}"
 
 
