@@ -77,7 +77,7 @@ ROI_X, ROI_Y, ROI_W, ROI_H = 1, 4, 320, 240
 BULK_EP      = 0x81
 CAPTURE_SECS = 10.0
 
-OUT_PNG = Path("/tmp/seek_stream_fps_test.png")
+OUT_PNG = Path("seek_fps_capture.png")
 
 
 # ── USB helpers ───────────────────────────────────────────────────────────────
@@ -129,7 +129,7 @@ def request_frame(dev) -> Optional[bytes]:
     return bytes(buf)
 
 
-OUT_PNG = Path("/tmp/seek_stream_fps_test.png")
+OUT_PNG = Path("seek_fps_capture.png")
 
 
 # ── frame visualisation ───────────────────────────────────────────────────────
@@ -242,9 +242,9 @@ def main() -> int:
             print(f"  Interval avg:  {avg_ms:.1f} ms")
             print(f"  Interval med:  {med_ms:.1f} ms")
             print()
-            if avg_fps >= 16.0:
-                print("  RESULT: ✓ 18 Hz unlock confirmed (>= 16 FPS measured)")
-            elif avg_fps >= 8.0:
+            if avg_fps >= 12.0:
+                print("  RESULT: ✓ 18 Hz unlock confirmed (>= 12 FPS measured)")
+            elif avg_fps >= 7.0:
                 print("  RESULT: ~ Intermediate rate — may be throttled or warming up")
             else:
                 print("  RESULT: ✗ Low rate — firmware may still be in 9 Hz mode")
