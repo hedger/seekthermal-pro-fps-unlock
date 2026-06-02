@@ -91,8 +91,11 @@ RAM_DATA_CASE0_ARG1 = 124   # 0x7C — requests the full 248-byte device-id bloc
 SUBCMD_MAIN_FW   = 0       # write target / factory-bank read alias
 SUBCMD_ACTIVE_FW = 8       # second bank (Bank B) — reflects last write (see FINDINGS.md)
 SUBCMD_BANK_TABLE = 3      # bootloader bank-selector table (active index + 3 bank addrs)
+SUBCMD_BOOTLOADER = 2      # bootloader sector (64 KiB, plain XIP — no encryption)
+SUBCMD_CONFIG     = 1      # config / calibration block
 SLOT_SIZE      = 0x10000 # 64 KiB physical slot
 READ_CAP       = 0xFF00  # FSM reliably caps reads at 65,280 B
+BOOTLOADER_SIZE = 0x10000 # 64 KiB — full bootloader sector
 READ_CHUNK     = 256
 
 # ============================================================================
@@ -381,14 +384,19 @@ def open_device() -> "usb.core.Device":
 # ============================================================================
 # Flash I/O
 # ============================================================================
-def dump_main_slot(w: Wire, *, bytes_to_read: int = READ_CAP,
-                   chunk: int = READ_CHUNK,
-                   subcmd: int = SUBCMD_MAIN_FW) -> bytes:
-    """Read `bytes_to_read` from the given firmware-related subcmd.
+def dump_slot(w: Wire, *, bytes_to_read: int = READ_CAP,
+              chunk: int = READ_CHUNK,
+              subcmd: int = SUBCMD_MAIN_FW) -> bytes:
+    """Read `bytes_to_read` from the given subcmd flash window.
+
     Read-only — never calls SetFeaturedFirmwareData or CompleteMemoryUpgrade.
 
-    On this firmware, subcmd 0 maps to the factory/rescue bank (Bank A)
-    and subcmd 8 maps to the active upgrade bank (Bank B). See FINDINGS.md.
+    Subcmd mapping (see FINDINGS.md):
+      0,5,7,9 → Bank A (factory, KeyA-encrypted)
+      8       → Bank B (active upgrade, KeyB-encrypted after first flash)
+      2       → Bootloader (64 KiB, plain XIP — no encryption)
+      1,4     → Config / calibration block
+      3       → Bank-selector table
     """
     if w.get_op() != 0:
         w.set_op(0)
@@ -412,6 +420,10 @@ def dump_main_slot(w: Wire, *, bytes_to_read: int = READ_CAP,
             break
         buf.extend(blk)
     return bytes(buf)
+
+
+# Compatibility alias for existing callers
+dump_main_slot = dump_slot
 
 
 def upload_image(w: Wire, image: bytes, *, chunk: int = 64) -> int:
@@ -638,19 +650,44 @@ def run(args: argparse.Namespace) -> int:
     serial = _sanitize_slug(w.get_serial()) or "noserial"
     print(f"      serial={serial}")
 
-    # 2. Read both firmware-related subcmds:
-    #      sub00 -> Bank A (factory/rescue, KeyA)
-    #      sub08 -> Bank B (active upgrade target, KeyB after device write)
-    print(f"\n[2/6] Reading firmware banks ({READ_CAP} B each) ...")
+    # 2. Read firmware banks, bootloader, and config
+    #      sub00 → Bank A (factory/rescue, KeyA)
+    #      sub08 → Bank B (active upgrade target, KeyB after device write)
+    #      sub02 → Bootloader (64 KiB, plain XIP)
+    #      sub03 → Bank-selector table
+    print(f"\n[2/6] Reading flash sectors ...")
     fw_info = w.get_firmware_info()
     slug = f"{serial}_{fw_info.slug}"
-    enc_a = dump_main_slot(w, subcmd=SUBCMD_MAIN_FW)
-    enc_b = dump_main_slot(w, subcmd=SUBCMD_ACTIVE_FW)
+    enc_a = dump_slot(w, subcmd=SUBCMD_MAIN_FW)
+    enc_b = dump_slot(w, subcmd=SUBCMD_ACTIVE_FW)
     print(f"      Bank A (sub00) head = {enc_a[:8].hex()}  ({len(enc_a)} B)")
     print(f"      Bank B (sub08) head = {enc_b[:8].hex()}  ({len(enc_b)} B)")
     art = save_artifact(slug, "bankA_raw", enc_a)
     print(f"      Saved: {art}")
     art = save_artifact(slug, "bankB_raw", enc_b)
+    print(f"      Saved: {art}")
+
+    # Bootloader (plain XIP, no encryption)
+    bootloader = dump_slot(w, subcmd=SUBCMD_BOOTLOADER, bytes_to_read=BOOTLOADER_SIZE)
+    bl_sp = struct.unpack_from("<I", bootloader, 0)[0]
+    bl_reset = struct.unpack_from("<I", bootloader, 4)[0]
+    bl_date_off = bootloader.find(b"Jan")
+    bl_date = bootloader[bl_date_off:bl_date_off+12].decode("ascii", errors="replace").strip("\x00").strip() if bl_date_off >= 0 else "?"
+    bl_time_off = bootloader.find(b":") - 5 if bootloader.find(b":") > 5 else -1
+    bl_time = bootloader[bl_time_off:bl_time_off+8].decode("ascii", errors="replace").strip("\x00").strip() if bl_time_off >= 0 else "?"
+    print(f"      Bootloader (sub02) SP=0x{bl_sp:08X} Reset=0x{bl_reset:08X}")
+    print(f"      Bootloader build: {bl_date} {bl_time}  ({len(bootloader)} B)")
+    art = save_artifact(slug, "bootloader", bootloader)
+    print(f"      Saved: {art}")
+
+    # Bank-selector table
+    bank_table = dump_slot(w, subcmd=SUBCMD_BANK_TABLE, bytes_to_read=256)
+    if len(bank_table) >= 16:
+        active_idx = struct.unpack_from("<I", bank_table, 0)[0]
+        addrs = [struct.unpack_from("<I", bank_table, 4 + i*4)[0] for i in range(3)]
+        banks_str = ", ".join(f"0x{a:08X}" for a in addrs)
+        print(f"      Bank table (sub03) active={active_idx}  banks=[{banks_str}]")
+    art = save_artifact(slug, "bank_table", bank_table)
     print(f"      Saved: {art}")
 
     # 3. Check Bank B first — that's where the device actually boots from
