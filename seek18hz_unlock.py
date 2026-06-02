@@ -39,6 +39,7 @@ import re
 import struct
 import sys
 import time
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -88,15 +89,29 @@ RAM_DATA_CASE_DEVICE_ID = 0  # window → g_device_id_block_a (248 B); serial at
 # Case 0 validates arg1 <= 0x7C (124), so 124 * 2 = 248 bytes max.
 RAM_DATA_CASE0_ARG1 = 124   # 0x7C — requests the full 248-byte device-id block
 
-SUBCMD_MAIN_FW   = 0       # write target / factory-bank read alias
-SUBCMD_ACTIVE_FW = 8       # second bank (Bank B) — reflects last write (see FINDINGS.md)
-SUBCMD_BANK_TABLE = 3      # bootloader bank-selector table (active index + 3 bank addrs)
-SUBCMD_BOOTLOADER = 2      # bootloader sector (64 KiB, plain XIP — no encryption)
-SUBCMD_CONFIG     = 1      # config / calibration block
-SLOT_SIZE      = 0x10000 # 64 KiB physical slot
-READ_CAP       = 0xFF00  # FSM reliably caps reads at 65,280 B
-BOOTLOADER_SIZE = 0x10000 # 64 KiB — full bootloader sector
+# ============================================================================
+# Subcmd dumping — exploratory probe of all accessible flash windows
+#
+# Instead of assuming a fixed mapping, we probe a range of BeginFirmwareUpgrade
+# subcmds and save whatever raw data the device returns. Subcmds that error out
+# or return only 0xFF padding are skipped. The patch logic still uses specific
+# subcmds (0 = write target, 8 = active bank readback) which were identified
+# through prior RE; those constants remain for the unlock path only.
+# ============================================================================
+
+# Subcmds probed during exploratory dump.
+# The firmware has 68 entries (0..67) in its BeginFirmwareUpgrade dispatch table;
+# subcmds 46-67 all return 0xFF (unmapped) on our unit but may differ on others.
+SUBCMD_DUMP_RANGE = range(0, 68)  # probe all 68 known subcmd slots
+
+# Patch-relevant subcmds (identified via prior RE, not assumed from mapping)
+SUBCMD_MAIN_FW   = 0     # write target (Bank A for reads, Bank B for writes)
+SUBCMD_ACTIVE_FW = 8     # Bank B readback (reflects last write after power-cycle)
+
+READ_CAP       = 0xFF00   # FSM reliably caps reads at 65,280 B
 READ_CHUNK     = 256
+SUBCMD_PROBE_SIZE = 256   # initial probe read for each subcmd (small/fast)
+SUBCMD_FULL_SIZE  = 0x10000  # full read for subcmds that return non-FF data
 
 # ============================================================================
 # Firmware layout
@@ -348,10 +363,10 @@ def _unique_path(p: Path) -> Path:
         n += 1
 
 
-def save_artifact(slug: str, kind: str, data: bytes) -> Path:
-    """Write data to seek_<slug>_<kind>.bin in the current directory.
-    Never clobbers an existing file — appends _001, _002 ... if needed."""
-    p = _unique_path(Path(f"seek_{slug}_{kind}.bin"))
+def save_derived(slug: str, subcmd: int, data: bytes, suffix: str) -> Path:
+    """Save a derived file (plain, patched, etc.) as
+    seek_<slug>_subcmd_<NN>_<suffix>.bin. Never clobbers."""
+    p = _unique_path(Path(f"seek_{slug}_subcmd_{subcmd:02d}_{suffix}.bin"))
     p.write_bytes(data)
     return p
 
@@ -384,6 +399,40 @@ def open_device() -> "usb.core.Device":
 # ============================================================================
 # Flash I/O
 # ============================================================================
+def _is_all_ff(data: bytes) -> bool:
+    """True if data is all 0xFF (erased/unmapped flash)."""
+    return all(b == 0xFF for b in data)
+
+
+def explore_subcmds(w: "Wire", slug: str, zf: zipfile.ZipFile,
+                    subcmds: range = SUBCMD_DUMP_RANGE,
+                    probe_size: int = SUBCMD_PROBE_SIZE,
+                    full_size: int = SUBCMD_FULL_SIZE,
+                    ) -> dict[int, bytes]:
+    """Probe each subcmd in *subcmds*, write non-empty dumps directly into *zf*.
+
+    Returns a dict of {subcmd: raw_data} for all subcmds that returned
+    non-0xFF data. No loose .bin files are created for dump data —
+    everything goes into the ZIP.
+    """
+    results: dict[int, bytes] = {}
+    name = lambda sc: f"seek_{slug}_subcmd_{sc:02d}.bin"
+    for sc in subcmds:
+        try:
+            probe = dump_slot(w, subcmd=sc, bytes_to_read=probe_size)
+        except IOError as e:
+            print(f"      subcmd {sc:02d}: SKIP ({e})")
+            continue
+        if not probe or _is_all_ff(probe):
+            continue
+        try:
+            data = dump_slot(w, subcmd=sc, bytes_to_read=full_size)
+        except IOError:
+            data = probe
+        results[sc] = data
+        zf.writestr(name(sc), data)
+        print(f"      subcmd {sc:02d}: {len(data):>5} B  head={data[:8].hex()}  → {name(sc)}")
+    return results
 def dump_slot(w: Wire, *, bytes_to_read: int = READ_CAP,
               chunk: int = READ_CHUNK,
               subcmd: int = SUBCMD_MAIN_FW) -> bytes:
@@ -650,45 +699,29 @@ def run(args: argparse.Namespace) -> int:
     serial = _sanitize_slug(w.get_serial()) or "noserial"
     print(f"      serial={serial}")
 
-    # 2. Read firmware banks, bootloader, and config
-    #      sub00 → Bank A (factory/rescue, KeyA)
-    #      sub08 → Bank B (active upgrade target, KeyB after device write)
-    #      sub02 → Bootloader (64 KiB, plain XIP)
-    #      sub03 → Bank-selector table
-    print(f"\n[2/6] Reading flash sectors ...")
     fw_info = w.get_firmware_info()
     slug = f"{serial}_{fw_info.slug}"
-    enc_a = dump_slot(w, subcmd=SUBCMD_MAIN_FW)
-    enc_b = dump_slot(w, subcmd=SUBCMD_ACTIVE_FW)
-    print(f"      Bank A (sub00) head = {enc_a[:8].hex()}  ({len(enc_a)} B)")
-    print(f"      Bank B (sub08) head = {enc_b[:8].hex()}  ({len(enc_b)} B)")
-    art = save_artifact(slug, "bankA_raw", enc_a)
-    print(f"      Saved: {art}")
-    art = save_artifact(slug, "bankB_raw", enc_b)
-    print(f"      Saved: {art}")
+    zip_path = _unique_path(Path(f"seek_{slug}_dump.zip"))
 
-    # Bootloader (plain XIP, no encryption)
-    bootloader = dump_slot(w, subcmd=SUBCMD_BOOTLOADER, bytes_to_read=BOOTLOADER_SIZE)
-    bl_sp = struct.unpack_from("<I", bootloader, 0)[0]
-    bl_reset = struct.unpack_from("<I", bootloader, 4)[0]
-    bl_date_off = bootloader.find(b"Jan")
-    bl_date = bootloader[bl_date_off:bl_date_off+12].decode("ascii", errors="replace").strip("\x00").strip() if bl_date_off >= 0 else "?"
-    bl_time_off = bootloader.find(b":") - 5 if bootloader.find(b":") > 5 else -1
-    bl_time = bootloader[bl_time_off:bl_time_off+8].decode("ascii", errors="replace").strip("\x00").strip() if bl_time_off >= 0 else "?"
-    print(f"      Bootloader (sub02) SP=0x{bl_sp:08X} Reset=0x{bl_reset:08X}")
-    print(f"      Bootloader build: {bl_date} {bl_time}  ({len(bootloader)} B)")
-    art = save_artifact(slug, "bootloader", bootloader)
-    print(f"      Saved: {art}")
+    # 2. Exploratory dump — probe all subcmds, write directly into ZIP
+    print(f"\n[2/6] Probing subcmds {SUBCMD_DUMP_RANGE.start}..{SUBCMD_DUMP_RANGE.stop - 1} ...")
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        dump_data = explore_subcmds(w, slug, zf)
+    if not dump_data:
+        sys.stderr.write("ERROR: no subcmds returned data — device may be in wrong mode.\n")
+        return 2
+    print(f"      {len(dump_data)} subcmd(s) returned non-empty data → {zip_path.name}")
 
-    # Bank-selector table
-    bank_table = dump_slot(w, subcmd=SUBCMD_BANK_TABLE, bytes_to_read=256)
-    if len(bank_table) >= 16:
-        active_idx = struct.unpack_from("<I", bank_table, 0)[0]
-        addrs = [struct.unpack_from("<I", bank_table, 4 + i*4)[0] for i in range(3)]
-        banks_str = ", ".join(f"0x{a:08X}" for a in addrs)
-        print(f"      Bank table (sub03) active={active_idx}  banks=[{banks_str}]")
-    art = save_artifact(slug, "bank_table", bank_table)
-    print(f"      Saved: {art}")
+    # Extract firmware banks for patch logic (subcmd 0 = Bank A, subcmd 8 = Bank B)
+    enc_a = dump_data.get(SUBCMD_MAIN_FW)
+    enc_b = dump_data.get(SUBCMD_ACTIVE_FW)
+    if not enc_a or not enc_b:
+        sys.stderr.write(
+            f"ERROR: missing firmware banks in dump "
+            f"(sub{SUBCMD_MAIN_FW:02d}={enc_a is not None}, "
+            f"sub{SUBCMD_ACTIVE_FW:02d}={enc_b is not None}).\n"
+        )
+        return 2
 
     # 3. Check Bank B first — that's where the device actually boots from
     #    after a successful upgrade. Bank A is the factory rescue.
@@ -706,7 +739,7 @@ def run(args: argparse.Namespace) -> int:
         img_a = FirmwareImage.from_encrypted(enc_a)
         print(f"      Bank A: {img_a.status.upper()}  (key={img_a.key_name})"
               f"  enable=0x{img_a.enable_byte:02X}  comp=0x{img_a.comp_byte:02X}")
-        art = save_artifact(slug, "bankA_plain", img_a.data)
+        art = save_derived(slug, SUBCMD_MAIN_FW, img_a.data, "plain")
         print(f"      Saved: {art}")
     except ValueError as e:
         print(f"      Bank A: UNKNOWN  ({e})")
@@ -743,9 +776,9 @@ def run(args: argparse.Namespace) -> int:
     if crypt(patched_enc, KEY_A) != patched.data:
         sys.stderr.write("ERROR: cipher round-trip failed; aborting.\n")
         return 2
-    art = save_artifact(slug, "patched_plain", patched.data)
+    art = save_derived(slug, SUBCMD_MAIN_FW, patched.data, "patched")
     print(f"      Saved: {art}")
-    art = save_artifact(slug, "patched_enc", patched_enc)
+    art = save_derived(slug, SUBCMD_MAIN_FW, patched_enc, "patched_enc")
     print(f"      Saved: {art}")
 
     # 5. Either dry-run or commit
